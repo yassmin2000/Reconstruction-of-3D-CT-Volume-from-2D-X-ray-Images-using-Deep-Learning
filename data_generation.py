@@ -15,9 +15,31 @@ from skimage import io
 import psutil
 from scipy.ndimage import zoom
 import cv2
-
 warnings.filterwarnings(action='ignore')
+import os
+from pydicom.errors import InvalidDicomError
 
+
+def is_dicom_file(fp: str) -> bool:
+    # LIDC files sometimes have no extension; also can be .dcm
+    name = os.path.basename(fp).lower()
+    return name.endswith(".dcm") or "." not in name
+
+def find_dicom_series_folder(patient_dir: str, min_files: int = 50) -> str | None:
+    """
+    Walk inside patient_dir and return a folder that looks like a CT series:
+    - contains many DICOM files (>= min_files)
+    """
+    best = None
+    best_count = 0
+
+    for root, _, files in os.walk(patient_dir):
+        dicom_files = [f for f in files if is_dicom_file(os.path.join(root, f))]
+        if len(dicom_files) > best_count and len(dicom_files) >= min_files:
+            best = root
+            best_count = len(dicom_files)
+
+    return best
 def plot_3d(image, threshold=-300):
 	# Position the scan upright,
 	# so the head of the patient would be at the top facing the camera
@@ -42,17 +64,41 @@ def plot_3d(image, threshold=-300):
 
 # Load the scans in given folder path
 def load_scan(path):
-	slices = [pydicom.read_file(path + '/' + s) for s in os.listdir(path)]
-	slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-	try:
-		slice_thickness = np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
-	except:
-		slice_thickness = np.abs(slices[0].SliceLocation - slices[1].SliceLocation)
+    slices = []
+    for fname in os.listdir(path):
+        fp = os.path.join(path, fname)
+        if not os.path.isfile(fp):
+            continue
+        try:
+            ds = pydicom.dcmread(fp, force=True)
+        except (InvalidDicomError, Exception):
+            continue
 
-	for s in slices:
-		s.SliceThickness = slice_thickness
+        # Keep only CT image slices (skip SR, RTSTRUCT, etc.)
+        if getattr(ds, "Modality", None) != "CT":
+            continue
+        if not hasattr(ds, "PixelData"):
+            continue
+        if not hasattr(ds, "ImagePositionPatient"):
+            continue
 
-	return slices
+        slices.append(ds)
+
+    if len(slices) < 2:
+        raise RuntimeError(f"Not enough CT slices found in: {path}")
+
+    slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+
+    # Slice thickness
+    try:
+        slice_thickness = abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
+    except Exception:
+        slice_thickness = abs(getattr(slices[0], "SliceLocation", 0) - getattr(slices[1], "SliceLocation", 0))
+
+    for s in slices:
+        s.SliceThickness = slice_thickness
+
+    return slices
 
 
 def convert_dcm_to_npy(images):
@@ -167,17 +213,44 @@ parser = ConfigParser()
 parser.read('./lidc.conf')
 
 # Some constants
-input_folder = '/home/daisylabs/aritra_project/LIDC-IDRI/'
-output_folder = '/home/daisylabs/aritra_project/dataset'
-patients = os.listdir(input_folder)
-patients.sort()
+input_folder = r"D:/UofA/Courses/ECE 740/Reconstruction-of-3D-CT-Volume-from-2D-X-ray-Images-using-Deep-Learning/LIDC_dataset/LIDC-IDRI"
+output_folder = r"D:/UofA/Courses/ECE 740/Reconstruction-of-3D-CT-Volume-from-2D-X-ray-Images-using-Deep-Learning/DRRs"
 
-num_cpus = psutil.cpu_count(logical=False)
-ray.init(num_cpus=num_cpus)
-pat_idxs = np.array_split(np.arange(len(patients)), num_cpus)
-patients = ray.put(patients)
-output_folder = ray.put(output_folder)
-meta_infos = ray.get([do_full_prprocessing.remote(patients, output_folder, pat_idxs[i]) for i in range(num_cpus)])
-ray.shutdown()
-print(meta_infos)
+patients = sorted([p for p in os.listdir(input_folder) if p.startswith("LIDC-IDRI-")])
+os.makedirs(output_folder, exist_ok=True)
+
+for pid in patients:
+    patient_dir = os.path.join(input_folder, pid)
+    series_dir = find_dicom_series_folder(patient_dir, min_files=50)
+    if series_dir is None:
+        print(f"[SKIP] {pid}: no series folder found")
+        continue
+
+    try:
+        dcm_slices = load_scan(series_dir)                 # <-- now robust
+        patient_pixels = get_pixels_hu(dcm_slices)
+        pix_resampled, spacing = resample(patient_pixels, dcm_slices, [1, 1, 1])
+
+        out_dir = os.path.join(output_folder, pid)
+        os.makedirs(out_dir, exist_ok=True)
+
+        drr_front = generate_drr_from_ct(pix_resampled, direction='frontal')
+        drr_lat   = generate_drr_from_ct(pix_resampled, direction='lateral')
+        drr_top   = generate_drr_from_ct(pix_resampled, direction='top')
+        pix_resampled = np.transpose(pix_resampled, axes=(1, 0, 2))
+        org_shape = pix_resampled.shape
+        pix_resampled = zoom(pix_resampled, (512 / org_shape[0], 512 / org_shape[1], 512 / org_shape[2]))
+        pix_resampled = (pix_resampled - np.min(pix_resampled)) / (np.max(pix_resampled) - np.min(pix_resampled) + 1e-8)
+        np.save(os.path.join(out_dir, f"{pid}.npy"), pix_resampled)
+        def save_drr(drr, name):
+                  drr = cv2.resize(drr, (512, 512), interpolation=cv2.INTER_LINEAR)
+                  drr = (drr - np.min(drr)) / (np.max(drr) - np.min(drr) + 1e-8)
+                  np.save(os.path.join(out_dir, name), drr)
+        save_drr(drr_front, f"{pid}_drrFrontal.npy")
+        save_drr(drr_lat,   f"{pid}_drrLateral.npy")
+        save_drr(drr_top,   f"{pid}_drrTop.npy")
+        print(f"[OK] {pid}: {len(dcm_slices)} slices from {series_dir}")
+
+    except Exception as e:
+        print(f"[FAIL] {pid}: {e}")
 
