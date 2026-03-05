@@ -112,8 +112,8 @@ def main():
     # =============================
 
     batch_size = 2
-    no_of_epochs = 100
-    results_path = r"D:\Project Data\results"
+    no_of_epochs = 1000
+    results_path = r"\results"
 
     os.makedirs(results_path, exist_ok=True)
 
