@@ -31,7 +31,8 @@ class UNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.dconv_down1 = double_conv(3, 300)
+        #self.dconv_down1 = double_conv(3, 300) # For multi view
+        self.dconv_down1 = double_conv(1, 300) # For view 1
         self.dconv_down2 = double_conv(300, 512)
         self.dconv_down3 = double_conv(512, 1024)
         self.dconv_down4 = double_conv(1024, 2048)
@@ -48,7 +49,8 @@ class UNet(nn.Module):
         self.dconv_up12 = single_out1(512, 300)
         self.dconv = single_out(300, 256)
         self.dconv1 = single_out1(1, 1)
-        self.dconv2 = single_out(1, 3)
+        #self.dconv2 = single_out(1, 3) # for 3 drr views
+        self.dconv2 = single_out(1, 1) # for 1 view 
 
     def forward(self, x):
         conv1 = self.dconv_down1(x)
